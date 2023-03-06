@@ -7,17 +7,22 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/url"
 	"openai/internal/config"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	api     = "https://api.openai.com/v1/completions"
-	MsgWait = "这个问题比较复杂，再稍等一下～"
+	api          = "https://api.openai.com/v1/chat/completions"
+	MsgWait      = "这个问题比较复杂，再稍等一下～"
+	exchangeRate = 6.9
 )
+
+var totaltokens int64
 
 var (
 	// 结果缓存（主要用于超时，用户重新提问后能给出答案）
@@ -33,8 +38,22 @@ func init() {
 	}()
 }
 
+type request struct {
+	Model    string       `json:"model"`
+	Messages []reqMessage `json:"messages"`
+}
+type reqMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
 type response struct {
-	ID string `json:"id"`
+	ID    string `json:"id"`
+	Usage struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+	} `json:"usage"`
 	// Object  string                 `json:"object"`
 	// Created int                    `json:"created"`
 	// Model   string                 `json:"model"`
@@ -46,10 +65,9 @@ type response struct {
 }
 
 type choiceItem struct {
-	Text string `json:"text"`
-	// Index        int    `json:"index"`
-	// Logprobs     int    `json:"logprobs"`
-	// FinishReason string `json:"finish_reason"`
+	Message struct {
+		Content string `json:"content"`
+	} `json:"message"`
 }
 
 // OpenAI可能无法在希望的时间内做出回复
@@ -75,7 +93,6 @@ func Query(msg string, timeout time.Duration) string {
 	resultCache.Store(msg, MsgWait)
 
 	go func(msg string, ctx context.Context, ch chan string) {
-		start := time.Now()
 		result, err := completions(msg, time.Second*180)
 		if err != nil {
 			result = "发生错误「" + err.Error() + "」，您重试一下"
@@ -88,14 +105,13 @@ func Query(msg string, timeout time.Duration) string {
 			resultCache.Delete(msg)
 		}
 		close(ch)
-		log.Printf("用时%ds，「%s」 \n %s \n\n", int(time.Since(start).Seconds()), msg, result)
 	}(msg, ctx, ch)
 
 	var result string
 	select {
 	case result = <-ch:
 	case <-ctx.Done():
-		result = "超时啦，请稍等20-60s后再问我，就告诉你。"
+		result = "请稍等10s后复制问题再问我一遍"
 	}
 
 	return result
@@ -103,31 +119,36 @@ func Query(msg string, timeout time.Duration) string {
 
 // https://beta.openai.com/docs/api-reference/making-requests
 func completions(msg string, timeout time.Duration) (string, error) {
-	msg, wordSize := queryMsg(msg)
-	if wordSize == 0 {
+	start := time.Now()
+	msg = strings.TrimSpace(msg)
+	length := len([]rune(msg))
+	if length <= 1 {
 		return "请说详细些...", nil
 	}
+	var r request
+	r.Model = "gpt-3.5-turbo"
+	r.Messages = []reqMessage{{
+		Role:    "user",
+		Content: msg,
+	}}
 
-	// fmt.Println("openai请求内容：", msg)
-	params := map[string]interface{}{
-		"model":  "text-davinci-003",
-		"prompt": msg,
-		// 影响回复速度和内容长度。  回复长度耗费token，影响花费的金额
-		"max_tokens": wordSize * 3,
-		// 0-1，默认1，越高越有创意
-		"temperature": 0.8,
-		// "top_p":             1,
-		// "frequency_penalty": 0,
-		// "presence_penalty":  0,
-		// "stop": "。",
+	bs, err := json.Marshal(r)
+	if err != nil {
+		return "", err
 	}
-
-	bs, _ := json.Marshal(params)
 
 	client := &http.Client{Timeout: timeout}
 	req, _ := http.NewRequest("POST", api, bytes.NewReader(bs))
 	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("Authorization", "Bearer "+config.ApiKey)
+	req.Header.Add("Authorization", "Bearer "+config.C.OpenAI.Key)
+
+	// 设置代理
+	if config.C.Http.Proxy != "" {
+		proxyURL, _ := url.Parse(config.C.Http.Proxy)
+		client.Transport = &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		}
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -143,7 +164,21 @@ func completions(msg string, timeout time.Duration) (string, error) {
 	var data response
 	json.Unmarshal(body, &data)
 	if len(data.Choices) > 0 {
-		return replyMsg(data.Choices[0].Text), nil
+		atomic.AddInt64(&totaltokens, int64(data.Usage.TotalTokens))
+
+		reply := replyMsg(data.Choices[0].Message.Content)
+		log.Printf("本次:用时:%ds,花费约:%f¥,token:%d,请求:%d,回复:%d。 服务启动至今累计花费约:%f¥ \nQ:%s \nA:%s \n",
+			int(time.Since(start).Seconds()),
+			float32(data.Usage.TotalTokens/1000)*0.002*exchangeRate,
+			data.Usage.TotalTokens,
+			data.Usage.PromptTokens,
+			data.Usage.CompletionTokens,
+			float32(totaltokens/1000)*0.002*exchangeRate,
+			msg,
+			reply,
+		)
+
+		return reply, nil
 	}
 
 	return data.Error.Message, nil
