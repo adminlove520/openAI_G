@@ -56,3 +56,7 @@
   ```
 发生错误「Post "https://api.openai.com/v1/completions": dial tcp 31.13.91.6:443: i/o timeout」，您重试一下 
   ```
+- 2023年3月8日00:43:53，代理报错：
+- 发生错误「Post "https://api.openai.com/v1/chat/completions": proxyconnect tcp: EOF」，您重试一下
+- 目测是代理的问题，暂时更换代理方式  
+- 
